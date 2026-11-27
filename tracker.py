@@ -6,8 +6,7 @@ import requests
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 STATE_FILE = "seen_shows.json"
 
 TARGET_DATE = "20261217"  # Dec 17, 2026 ONLY
@@ -15,28 +14,36 @@ HEARTBEAT_INTERVAL = 30 * 60  # 30 minutes in seconds
 
 SOURCES = [
     {
-        "name": "BookMyShow",
+        "name": "BMS (Main)",
+        "type": "bms",
         "url": f"https://in.bookmyshow.com/movies/chennai/avengers-doomsday/buytickets/ET00526312/{TARGET_DATE}",
     },
     {
+        "name": "BMS (3D/IMAX)",
+        "type": "bms",
+        "url": f"https://in.bookmyshow.com/movies/chennai/avengers-doomsday/buytickets/ET00526306/{TARGET_DATE}",
+    },
+    {
         "name": "District",
+        "type": "district",
         "url": "https://www.district.in/movies/avengers-doomsday-movie-tickets-in-chennai",
     },
     {
         "name": "PVR/INOX",
+        "type": "pvr",
         "url": "https://www.pvrcinemas.com/moviesessions/Chennai/AVENGERS-DOOMSDAY/35312",
     },
 ]
 
 TIME_PATTERN = re.compile(r"\b(0?\d|1[0-2]):[0-5]\d\s?(?:AM|PM)\b", re.IGNORECASE)
-FORMAT_KEYWORDS = ["IMAX", "PXL", "4DX", "DOLBY", "MS-INFINITY", "3D", "2D"]
+FORMAT_KEYWORDS = ["IMAX", "PXL", "4DX", "DOLBY", "MS-INFINITY", "MS INFVSN", "3D", "2D"]
 
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, list):  # Upgrade from older format
+            if isinstance(data, list):
                 return {"seen": set(data), "last_heartbeat": 0}
             return {
                 "seen": set(data.get("seen", [])),
@@ -57,29 +64,28 @@ def save_state(state):
         )
 
 
-def send_telegram(text, urgent=False):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    buttons = {
-        "inline_keyboard": [
-            [
-                {"text": "🎟️ BookMyShow", "url": SOURCES[0]["url"]},
-                {"text": "🎟️ District", "url": SOURCES[1]["url"]},
-                {"text": "🎟️ PVR/INOX", "url": SOURCES[2]["url"]},
-            ]
-        ]
-    }
-    chunks = [text[i : i + 3900] for i in range(0, len(text), 3900)]
+def send_discord(text, urgent=False):
+    links = (
+        f"\n🔗 **[BMS Main]({SOURCES[0]['url']})** | "
+        f"**[BMS 3D]({SOURCES[1]['url']})** | "
+        f"**[District]({SOURCES[2]['url']})** | "
+        f"**[PVR/INOX]({SOURCES[3]['url']})**"
+    )
+    full_text = text + links
+
+    chunks = [full_text[i : i + 3900] for i in range(0, len(full_text), 3900)]
     for idx, chunk in enumerate(chunks):
         payload = {
-            "chat_id": CHAT_ID,
-            "text": chunk,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True,
-            "disable_notification": not urgent,
+            "username": "Avengers Doomsday Tracker",
+            "content": "@everyone 🚨 **FDFS / MORNING ENGLISH TICKETS LIVE!**" if (urgent and idx == 0) else None,
+            "embeds": [
+                {
+                    "description": chunk,
+                    "color": 15158332 if urgent else 3447003,
+                }
+            ],
         }
-        if idx == len(chunks) - 1:
-            payload["reply_markup"] = buttons
-        requests.post(url, json=payload, timeout=15)
+        requests.post(WEBHOOK_URL, json=payload, timeout=15)
 
 
 def get_time_slot(time_str):
@@ -108,7 +114,7 @@ def detect_language(text):
     return "English"
 
 
-def scrape_bms(page, url):
+def scrape_bms(page, url, label):
     found = []
     page.goto(url, wait_until="domcontentloaded", timeout=45000)
     page.wait_for_timeout(4000)
@@ -128,7 +134,7 @@ def scrape_bms(page, url):
         fmt = detect_format(block)
         for t in full_times:
             found.append({
-                "source": "BMS", "theatre": theatre, "lang": lang,
+                "source": label, "theatre": theatre, "lang": lang,
                 "format": fmt, "time": t, "slot": get_time_slot(t),
             })
     return found
@@ -175,7 +181,6 @@ def scrape_pvr(page, url):
     if "Access Denied" in page.content() or "Verify you are human" in page.content():
         return None
 
-    # Click Dec 17 date pill if visible
     dec17 = page.locator("text=/17\\s*Dec|Dec\\s*17|\\b17\\b/i").first
     if dec17.count() > 0:
         try:
@@ -192,7 +197,9 @@ def scrape_pvr(page, url):
             continue
         lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
         theatre = lines[0] if lines else "PVR/INOX Chennai"
-        if len(theatre) > 90 or not any(k in theatre.upper() for k in ["PVR", "INOX", "SATHYAM", "ESCAPE", "PALAZZO", "LUXE", "VR"]):
+        if len(theatre) > 90 or not any(
+            k in theatre.upper() for k in ["PVR", "INOX", "SATHYAM", "ESCAPE", "PALAZZO", "LUXE", "VR"]
+        ):
             continue
         for t in full_times:
             found.append({
@@ -206,7 +213,7 @@ def scrape_pvr(page, url):
 def group_by_theatre(items):
     grouped = {}
     for x in items:
-        label = f"*{x['theatre']}* ({x['lang']} • {x['format']} • {x['source']})"
+        label = f"**{x['theatre']}** ({x['lang']} • {x['format']} • {x['source']})"
         grouped.setdefault(label, []).append(x["time"])
     return [f"• {k}\n  └ {', '.join(sorted(set(v)))}" for k, v in grouped.items()]
 
@@ -217,21 +224,21 @@ def format_report(title, items):
     eng_other = [x for x in items if x["lang"] == "English" and x["slot"] == "OTHER"]
     tamil_all = [x for x in items if x["lang"] == "Tamil"]
 
-    lines = [title, ""]
+    lines = [f"### {title}", ""]
     if eng_fdfs:
-        lines.append("🔥 *ENGLISH FDFS (Before 8 AM)*")
+        lines.append("🔥 **ENGLISH FDFS (Before 8 AM)**")
         lines.extend(group_by_theatre(eng_fdfs))
         lines.append("")
     if eng_morning:
-        lines.append("🌅 *ENGLISH MORNING (8 AM – 10:30 AM)*")
+        lines.append("🌅 **ENGLISH MORNING (8 AM – 10:30 AM)**")
         lines.extend(group_by_theatre(eng_morning))
         lines.append("")
     if eng_other:
-        lines.append("🎬 *ENGLISH OTHER SHOWS*")
+        lines.append("🎬 **ENGLISH OTHER SHOWS**")
         lines.extend(group_by_theatre(eng_other))
         lines.append("")
     if tamil_all:
-        lines.append("🎟️ *TAMIL SHOWS (Backup)*")
+        lines.append("🎟️ **TAMIL SHOWS (Backup)**")
         lines.extend(group_by_theatre(tamil_all))
         lines.append("")
 
@@ -266,9 +273,9 @@ def main():
 
         for src in SOURCES:
             try:
-                if src["name"] == "BookMyShow":
-                    results = scrape_bms(page, src["url"])
-                elif src["name"] == "District":
+                if src["type"] == "bms":
+                    results = scrape_bms(page, src["url"], src["name"])
+                elif src["type"] == "district":
                     results = scrape_district(page, src["url"])
                 else:
                     results = scrape_pvr(page, src["url"])
@@ -291,21 +298,18 @@ def main():
 
     state_changed = False
 
-    # 1. Instant Alert if new shows opened (or first run)
     if new_items:
-        header = "📋 *INITIAL DEC 17 SNAPSHOT*" if is_first_run else "🚨 *NEW DEC 17 SHOWS OPENED*"
+        header = "📋 INITIAL DEC 17 SNAPSHOT" if is_first_run else "🚨 NEW DEC 17 SHOWS OPENED"
         msg, urgent = format_report(header, new_items)
-        send_telegram(msg, urgent=(urgent or is_first_run))
+        send_discord(msg, urgent=(urgent or is_first_run))
         state["last_heartbeat"] = now
         state_changed = True
-
-    # 2. 30-Minute Silent Status Heartbeat (only if no instant alert was just sent)
     elif heartbeat_due:
         if all_scraped:
-            msg, _ = format_report("⏱️ *30-MIN STATUS: CURRENT DEC 17 SHOWS*", all_scraped)
+            msg, _ = format_report("⏱️ 30-MIN STATUS: CURRENT DEC 17 SHOWS", all_scraped)
         else:
-            msg = f"⏱️ *30-MIN STATUS:* Tracker is running, but no shows parsed. Blocked: {', '.join(blocked_sources) or 'None'}."
-        send_telegram(msg, urgent=False)
+            msg = f"⏱️ **30-MIN STATUS:** Tracker running, 0 shows parsed. Blocked: {', '.join(blocked_sources) or 'None'}."
+        send_discord(msg, urgent=False)
         state["last_heartbeat"] = now
         state_changed = True
 
