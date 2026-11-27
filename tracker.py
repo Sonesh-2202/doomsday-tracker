@@ -2,38 +2,23 @@ import json
 import os
 import re
 import time
+from bs4 import BeautifulSoup
+from curl_cffi import requests as cffi_requests
 import requests
-from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 STATE_FILE = "seen_shows.json"
 
-TARGET_DATE = "20261217"  # Dec 17, 2026 ONLY
-HEARTBEAT_INTERVAL = 30 * 60  # 30 minutes in seconds
+TARGET_DATE = "20261217"  # Dec 17, 2026
+TARGET_DATE_DASH = "2026-12-17"
+HEARTBEAT_INTERVAL = 30 * 60
 
-SOURCES = [
-    {
-        "name": "BMS (Main)",
-        "type": "bms",
-        "url": f"https://in.bookmyshow.com/movies/chennai/avengers-doomsday/buytickets/ET00526312/{TARGET_DATE}",
-    },
-    {
-        "name": "BMS (3D/IMAX)",
-        "type": "bms",
-        "url": f"https://in.bookmyshow.com/movies/chennai/avengers-doomsday/buytickets/ET00526306/{TARGET_DATE}",
-    },
-    {
-        "name": "District",
-        "type": "district",
-        "url": "https://www.district.in/movies/avengers-doomsday-movie-tickets-in-chennai",
-    },
-    {
-        "name": "PVR/INOX",
-        "type": "pvr",
-        "url": "https://www.pvrcinemas.com/moviesessions/Chennai/AVENGERS-DOOMSDAY/35312",
-    },
-]
+LINKS = {
+    "bms_main": f"https://in.bookmyshow.com/movies/chennai/avengers-doomsday/buytickets/ET00526312/{TARGET_DATE}",
+    "bms_3d": f"https://in.bookmyshow.com/movies/chennai/avengers-doomsday/buytickets/ET00526306/{TARGET_DATE}",
+    "district": "https://www.district.in/movies/avengers-doomsday-movie-tickets-in-chennai",
+    "pvr": "https://www.pvrcinemas.com/moviesessions/Chennai/AVENGERS-DOOMSDAY/35312",
+}
 
 TIME_PATTERN = re.compile(r"\b(0?\d|1[0-2]):[0-5]\d\s?(?:AM|PM)\b", re.IGNORECASE)
 FORMAT_KEYWORDS = ["IMAX", "PXL", "4DX", "DOLBY", "MS-INFINITY", "MS INFVSN", "3D", "2D"]
@@ -66,24 +51,18 @@ def save_state(state):
 
 def send_discord(text, urgent=False):
     links = (
-        f"\n🔗 **[BMS Main]({SOURCES[0]['url']})** | "
-        f"**[BMS 3D]({SOURCES[1]['url']})** | "
-        f"**[District]({SOURCES[2]['url']})** | "
-        f"**[PVR/INOX]({SOURCES[3]['url']})**"
+        f"\n🔗 **[BMS Main]({LINKS['bms_main']})** | "
+        f"**[BMS 3D]({LINKS['bms_3d']})** | "
+        f"**[District]({LINKS['district']})** | "
+        f"**[PVR/INOX]({LINKS['pvr']})**"
     )
     full_text = text + links
-
     chunks = [full_text[i : i + 3900] for i in range(0, len(full_text), 3900)]
     for idx, chunk in enumerate(chunks):
         payload = {
             "username": "Avengers Doomsday Tracker",
             "content": "@everyone 🚨 **FDFS / MORNING ENGLISH TICKETS LIVE!**" if (urgent and idx == 0) else None,
-            "embeds": [
-                {
-                    "description": chunk,
-                    "color": 15158332 if urgent else 3447003,
-                }
-            ],
+            "embeds": [{"description": chunk, "color": 15158332 if urgent else 3447003}],
         }
         requests.post(WEBHOOK_URL, json=payload, timeout=15)
 
@@ -114,98 +93,79 @@ def detect_language(text):
     return "English"
 
 
-def scrape_bms(page, url, label):
+def fetch_pvr_api(session):
+    """Queries PVR/INOX backend session API directly."""
     found = []
-    page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_timeout(4000)
-    if "Attention Required! | Cloudflare" in page.content() or "Verify you are human" in page.content():
+    api_url = "https://api3.pvrcinemas.com/api/v1/booking/content/msessions"
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": "https://www.pvrcinemas.com",
+        "Referer": "https://www.pvrcinemas.com/",
+        "city": "Chennai",
+        "platform": "WEB",
+        "country": "INDIA",
+    }
+    payload = {
+        "city": "Chennai",
+        "mid": "35312",
+        "experience": "ALL",
+        "lang": "ALL",
+        "format": "ALL",
+        "dated": TARGET_DATE_DASH,
+    }
+    resp = session.post(api_url, json=payload, headers=headers, timeout=20)
+    if resp.status_code != 200:
         return None
 
-    default_lang = detect_language(page.inner_text("body"))
-    venues = page.locator("li.list, [data-venue-code], div[class*='Venue']")
-    for i in range(venues.count()):
-        block = venues.nth(i).inner_text()
-        full_times = [m.group(0).upper() for m in TIME_PATTERN.finditer(block)]
-        if not full_times:
-            continue
-        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-        theatre = lines[0] if lines else "Unknown Theatre"
-        lang = detect_language(block) if ("TAMIL" in block.upper() or "ENGLISH" in block.upper()) else default_lang
-        fmt = detect_format(block)
-        for t in full_times:
-            found.append({
-                "source": label, "theatre": theatre, "lang": lang,
-                "format": fmt, "time": t, "slot": get_time_slot(t),
-            })
+    data = resp.json()
+    cinemas = data.get("output", {}).get("c", [])
+    for cinema in cinemas:
+        theatre = cinema.get("n", "PVR/INOX Chennai")
+        for s_group in cinema.get("s", []):
+            lang = s_group.get("l", "English").title()
+            fmt = s_group.get("f", "2D/3D")
+            for show in s_group.get("t", []):
+                t_str = show.get("st", "").upper()
+                if t_str:
+                    found.append({
+                        "source": "PVR/INOX",
+                        "theatre": theatre,
+                        "lang": lang,
+                        "format": fmt,
+                        "time": t_str,
+                        "slot": get_time_slot(t_str),
+                    })
     return found
 
 
-def scrape_district(page, url):
-    found = []
-    page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_timeout(4000)
-    if "Access Denied" in page.content() or "Verify you are human" in page.content():
+def fetch_html_source(session, url, source_name):
+    """Fetches District or BMS using Chrome 131 TLS impersonation."""
+    resp = session.get(url, timeout=20)
+    if resp.status_code in (403, 429, 503) or "Verify you are human" in resp.text:
         return None
 
-    dec17 = page.locator("text=/17\\s*Dec|Dec\\s*17/i").first
-    if dec17.count() > 0:
-        try:
-            dec17.click(timeout=3000)
-            page.wait_for_timeout(2000)
-        except Exception:
-            pass
-
-    blocks = page.locator("div[class*='cinema'], div[class*='venue'], section")
-    for i in range(min(blocks.count(), 120)):
-        block = blocks.nth(i).inner_text()
-        full_times = [m.group(0).upper() for m in TIME_PATTERN.finditer(block)]
-        if not full_times:
-            continue
-        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-        theatre = lines[0] if lines else "Chennai Theatre"
-        if len(theatre) > 90:
-            continue
-        for t in full_times:
-            found.append({
-                "source": "District", "theatre": theatre,
-                "lang": detect_language(block), "format": detect_format(block),
-                "time": t, "slot": get_time_slot(t),
-            })
-    return found
-
-
-def scrape_pvr(page, url):
+    soup = BeautifulSoup(resp.text, "html.parser")
     found = []
-    page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_timeout(5000)
-    if "Access Denied" in page.content() or "Verify you are human" in page.content():
-        return None
 
-    dec17 = page.locator("text=/17\\s*Dec|Dec\\s*17|\\b17\\b/i").first
-    if dec17.count() > 0:
-        try:
-            dec17.click(timeout=3000)
-            page.wait_for_timeout(2500)
-        except Exception:
-            pass
+    # Parse embedded Next.js / JSON state if present
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    raw_text = next_data.string if next_data and next_data.string else soup.get_text("\n")
 
-    blocks = page.locator("div[class*='cinema'], div[class*='theatre'], div[class*='session']")
-    for i in range(min(blocks.count(), 100)):
-        block = blocks.nth(i).inner_text()
-        full_times = [m.group(0).upper() for m in TIME_PATTERN.finditer(block)]
-        if not full_times:
+    for line in raw_text.splitlines():
+        times = [m.group(0).upper() for m in TIME_PATTERN.finditer(line)]
+        if not times:
             continue
-        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-        theatre = lines[0] if lines else "PVR/INOX Chennai"
-        if len(theatre) > 90 or not any(
-            k in theatre.upper() for k in ["PVR", "INOX", "SATHYAM", "ESCAPE", "PALAZZO", "LUXE", "VR"]
-        ):
+        clean = re.sub(r"\s+", " ", line).strip()
+        if len(clean) > 120:
             continue
-        for t in full_times:
+        for t in times:
             found.append({
-                "source": "PVR/INOX", "theatre": theatre,
-                "lang": detect_language(block), "format": detect_format(block),
-                "time": t, "slot": get_time_slot(t),
+                "source": source_name,
+                "theatre": clean.split(t)[0].strip(" -|:") or f"{source_name} Chennai",
+                "lang": detect_language(clean),
+                "format": detect_format(clean),
+                "time": t,
+                "slot": get_time_slot(t),
             })
     return found
 
@@ -242,8 +202,7 @@ def format_report(title, items):
         lines.extend(group_by_theatre(tamil_all))
         lines.append("")
 
-    urgent = bool(eng_fdfs or eng_morning)
-    return "\n".join(lines), urgent
+    return "\n".join(lines), bool(eng_fdfs or eng_morning)
 
 
 def main():
@@ -256,38 +215,25 @@ def main():
     all_scraped = []
     blocked_sources = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 768},
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-        )
-        page = context.new_page()
-        stealth_sync(page)
+    session = cffi_requests.Session(impersonate="chrome131")
 
-        for src in SOURCES:
-            try:
-                if src["type"] == "bms":
-                    results = scrape_bms(page, src["url"], src["name"])
-                elif src["type"] == "district":
-                    results = scrape_district(page, src["url"])
-                else:
-                    results = scrape_pvr(page, src["url"])
+    checks = [
+        ("PVR/INOX", lambda: fetch_pvr_api(session)),
+        ("District", lambda: fetch_html_source(session, LINKS["district"], "District")),
+        ("BMS (Main)", lambda: fetch_html_source(session, LINKS["bms_main"], "BMS Main")),
+        ("BMS (3D/IMAX)", lambda: fetch_html_source(session, LINKS["bms_3d"], "BMS 3D")),
+    ]
 
-                if results is None:
-                    blocked_sources.append(src["name"])
-                    continue
-                all_scraped.extend(results)
-            except Exception as e:
-                print(f"Error scraping {src['name']}: {e}")
-
-        browser.close()
+    for name, fn in checks:
+        try:
+            res = fn()
+            if res is None:
+                blocked_sources.append(name)
+            else:
+                all_scraped.extend(res)
+        except Exception as e:
+            blocked_sources.append(f"{name} (err)")
+            print(f"{name} failed: {e}")
 
     new_items = []
     for item in all_scraped:
@@ -297,7 +243,6 @@ def main():
             seen.add(key)
 
     state_changed = False
-
     if new_items:
         header = "📋 INITIAL DEC 17 SNAPSHOT" if is_first_run else "🚨 NEW DEC 17 SHOWS OPENED"
         msg, urgent = format_report(header, new_items)
@@ -308,7 +253,7 @@ def main():
         if all_scraped:
             msg, _ = format_report("⏱️ 30-MIN STATUS: CURRENT DEC 17 SHOWS", all_scraped)
         else:
-            msg = f"⏱️ **30-MIN STATUS:** Tracker running, 0 shows parsed. Blocked: {', '.join(blocked_sources) or 'None'}."
+            msg = f"⏱️ **30-MIN STATUS:** 0 shows parsed. Blocked: {', '.join(blocked_sources) or 'None'}."
         send_discord(msg, urgent=False)
         state["last_heartbeat"] = now
         state_changed = True
