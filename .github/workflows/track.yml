@@ -1,0 +1,39 @@
+name: Avengers Doomsday Dec 17 Tracker
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"  # Runs every 5 minutes
+  workflow_dispatch:       # Lets you test it manually anytime
+
+permissions:
+  contents: write          # Needed to save seen_shows.json back to the repo
+
+jobs:
+  check-tickets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Run tracker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python tracker.py
+
+      - name: Save updated state
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_shows.json || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update seen shows" && git push)
