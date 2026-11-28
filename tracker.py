@@ -3,33 +3,40 @@ import os
 import re
 import time
 from bs4 import BeautifulSoup
-from curl_cffi import requests as cffi_requests
 import requests
 
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 STATE_FILE = "seen_shows.json"
+HEARTBEAT_INTERVAL = 30 * 60  # 30 minutes
 
-TARGET_DATE = "20261217"  # Dec 17, 2026
-TARGET_DATE_DASH = "2026-12-17"
-HEARTBEAT_INTERVAL = 30 * 60
-
+MIRROR_URL = "https://ticketradar.in/f/avengers-doomsday/chennai"
 LINKS = {
-    "bms_main": f"https://in.bookmyshow.com/movies/chennai/avengers-doomsday/buytickets/ET00526312/{TARGET_DATE}",
-    "bms_3d": f"https://in.bookmyshow.com/movies/chennai/avengers-doomsday/buytickets/ET00526306/{TARGET_DATE}",
+    "bms_main": "https://in.bookmyshow.com/movies/chennai/avengers-doomsday/buytickets/ET00526312/20261217",
+    "bms_3d": "https://in.bookmyshow.com/movies/chennai/avengers-doomsday/buytickets/ET00526306/20261217",
     "district": "https://www.district.in/movies/avengers-doomsday-movie-tickets-in-chennai",
-    "pvr": "https://www.pvrcinemas.com/moviesessions/Chennai/AVENGERS-DOOMSDAY/35312",
+    "pvr": "https://www.pvrinox.com/moviesessions/chennai/avengers-doomsday/35312",
+}
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-IN,en;q=0.9",
 }
 
 TIME_PATTERN = re.compile(r"\b(0?\d|1[0-2]):[0-5]\d\s?(?:AM|PM)\b", re.IGNORECASE)
-FORMAT_KEYWORDS = ["IMAX", "PXL", "4DX", "DOLBY", "MS-INFINITY", "MS INFVSN", "3D", "2D"]
+THEATRE_SPLIT = re.compile(
+    r"(?=(?:PVR|INOX|Cinepolis|AGS|Sangam|Kamala|Sathyam|Escape|Rohini|Kasi|Vettri|GK Cinemas|MovieMax|Rakki|Miraj|Devi|Woodlands|Albert|Ega|Udhayam|Mayajaal|HDFC Millennia PVR)[:\s])"
+)
 
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, list):
-                return {"seen": set(data), "last_heartbeat": 0}
             return {
                 "seen": set(data.get("seen", [])),
                 "last_heartbeat": data.get("last_heartbeat", 0),
@@ -80,100 +87,71 @@ def get_time_slot(time_str):
     return "OTHER"
 
 
-def detect_format(text):
-    upper = text.upper()
-    found = [kw for kw in FORMAT_KEYWORDS if kw in upper]
-    return " / ".join(found) if found else "2D/3D"
-
-
-def detect_language(text):
-    upper = text.upper()
-    if "TAMIL" in upper and "ENGLISH" not in upper:
-        return "Tamil"
-    return "English"
-
-
-def fetch_pvr_api(session):
-    """Queries PVR/INOX backend session API directly."""
-    found = []
-    api_url = "https://api3.pvrcinemas.com/api/v1/booking/content/msessions"
-    headers = {
-        "Content-Type": "application/json",
-        "Origin": "https://www.pvrcinemas.com",
-        "Referer": "https://www.pvrcinemas.com/",
-        "city": "Chennai",
-        "platform": "WEB",
-        "country": "INDIA",
-    }
-    payload = {
-        "city": "Chennai",
-        "mid": "35312",
-        "experience": "ALL",
-        "lang": "ALL",
-        "format": "ALL",
-        "dated": TARGET_DATE_DASH,
-    }
-    resp = session.post(api_url, json=payload, headers=headers, timeout=20)
+def scrape_chennai_dec17():
+    resp = requests.get(MIRROR_URL, headers=HEADERS, timeout=25)
     if resp.status_code != 200:
-        return None
-
-    data = resp.json()
-    cinemas = data.get("output", {}).get("c", [])
-    for cinema in cinemas:
-        theatre = cinema.get("n", "PVR/INOX Chennai")
-        for s_group in cinema.get("s", []):
-            lang = s_group.get("l", "English").title()
-            fmt = s_group.get("f", "2D/3D")
-            for show in s_group.get("t", []):
-                t_str = show.get("st", "").upper()
-                if t_str:
-                    found.append({
-                        "source": "PVR/INOX",
-                        "theatre": theatre,
-                        "lang": lang,
-                        "format": fmt,
-                        "time": t_str,
-                        "slot": get_time_slot(t_str),
-                    })
-    return found
-
-
-def fetch_html_source(session, url, source_name):
-    """Fetches District or BMS using Chrome 131 TLS impersonation."""
-    resp = session.get(url, timeout=20)
-    if resp.status_code in (403, 429, 503) or "Verify you are human" in resp.text:
-        return None
+        return None, f"HTTP {resp.status_code}"
 
     soup = BeautifulSoup(resp.text, "html.parser")
+    text = soup.get_text("\n")
+
+    # Trim header and footer noise
+    if "Advance booking open" in text:
+        text = text.split("Advance booking open", 1)[1]
+    if "Premium screens in Chennai" in text:
+        text = text.split("Premium screens in Chennai", 1)[0]
+
     found = []
+    seen_local = set()
 
-    # Parse embedded Next.js / JSON state if present
-    next_data = soup.find("script", id="__NEXT_DATA__")
-    raw_text = next_data.string if next_data and next_data.string else soup.get_text("\n")
+    for block in THEATRE_SPLIT.split(text):
+        if "Thu 17 Dec" not in block:
+            continue
 
-    for line in raw_text.splitlines():
-        times = [m.group(0).upper() for m in TIME_PATTERN.finditer(line)]
-        if not times:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        theatre = lines[0][:80]
+        if "Book →" in theatre or len(theatre) < 5:
             continue
-        clean = re.sub(r"\s+", " ", line).strip()
-        if len(clean) > 120:
-            continue
-        for t in times:
-            found.append({
-                "source": source_name,
-                "theatre": clean.split(t)[0].strip(" -|:") or f"{source_name} Chennai",
-                "lang": detect_language(clean),
-                "format": detect_format(clean),
-                "time": t,
-                "slot": get_time_slot(t),
-            })
-    return found
+
+        # Split theatre block by language sections (e.g. "English · Ms-Infinity Vsn 3D" vs "Tamil · Ms-Infinity Vsn 3D")
+        lang_sections = re.split(r"(?=(?:English|Tamil|Hindi|Telugu)\s*·)", block)
+        for sec in lang_sections:
+            if "Thu 17 Dec" not in sec:
+                continue
+
+            sec_header = sec.splitlines()[0].strip()
+            if sec_header.startswith("Tamil"):
+                lang = "Tamil"
+            elif sec_header.startswith("English"):
+                lang = "English"
+            else:
+                continue
+
+            fmt = sec_header.split("·", 1)[1].strip() if "·" in sec_header else "3D"
+            # Extract ONLY Thu 17 Dec line/chunk before Fri 18 Dec
+            dec17_chunk = sec.split("Thu 17 Dec", 1)[1].split("Fri 18 Dec")[0]
+            times = [m.group(0).upper() for m in TIME_PATTERN.finditer(dec17_chunk)]
+
+            for t in times:
+                uid = (theatre, lang, fmt, t)
+                if uid in seen_local:
+                    continue
+                seen_local.add(uid)
+                found.append({
+                    "theatre": theatre,
+                    "lang": lang,
+                    "format": fmt,
+                    "time": t,
+                    "slot": get_time_slot(t),
+                })
+
+    return found, None
 
 
 def group_by_theatre(items):
     grouped = {}
     for x in items:
-        label = f"**{x['theatre']}** ({x['lang']} • {x['format']} • {x['source']})"
+        label = f"**{x['theatre']}** ({x['lang']} • {x['format']})"
         grouped.setdefault(label, []).append(x["time"])
     return [f"• {k}\n  └ {', '.join(sorted(set(v)))}" for k, v in grouped.items()]
 
@@ -212,48 +190,30 @@ def main():
     is_first_run = len(seen) == 0
     heartbeat_due = (now - state["last_heartbeat"]) >= HEARTBEAT_INTERVAL
 
-    all_scraped = []
-    blocked_sources = []
-
-    session = cffi_requests.Session(impersonate="chrome131")
-
-    checks = [
-        ("PVR/INOX", lambda: fetch_pvr_api(session)),
-        ("District", lambda: fetch_html_source(session, LINKS["district"], "District")),
-        ("BMS (Main)", lambda: fetch_html_source(session, LINKS["bms_main"], "BMS Main")),
-        ("BMS (3D/IMAX)", lambda: fetch_html_source(session, LINKS["bms_3d"], "BMS 3D")),
-    ]
-
-    for name, fn in checks:
-        try:
-            res = fn()
-            if res is None:
-                blocked_sources.append(name)
-            else:
-                all_scraped.extend(res)
-        except Exception as e:
-            blocked_sources.append(f"{name} (err)")
-            print(f"{name} failed: {e}")
+    shows, err = scrape_chennai_dec17()
+    if err:
+        if heartbeat_due or is_first_run:
+            send_discord(f"⚠️ **Tracker Fetch Error:** {err}", urgent=False)
+            state["last_heartbeat"] = now
+            save_state(state)
+        return
 
     new_items = []
-    for item in all_scraped:
-        key = f"{item['source']}|{item['theatre']}|{item['lang']}|{item['format']}|{item['time']}"
+    for item in shows:
+        key = f"{item['theatre']}|{item['lang']}|{item['format']}|{item['time']}"
         if key not in seen:
             new_items.append(item)
             seen.add(key)
 
     state_changed = False
     if new_items:
-        header = "📋 INITIAL DEC 17 SNAPSHOT" if is_first_run else "🚨 NEW DEC 17 SHOWS OPENED"
+        header = "📋 INITIAL DEC 17 SNAPSHOT (11+ CHENNAI THEATRES)" if is_first_run else "🚨 NEW DEC 17 SHOWS OPENED"
         msg, urgent = format_report(header, new_items)
         send_discord(msg, urgent=(urgent or is_first_run))
         state["last_heartbeat"] = now
         state_changed = True
     elif heartbeat_due:
-        if all_scraped:
-            msg, _ = format_report("⏱️ 30-MIN STATUS: CURRENT DEC 17 SHOWS", all_scraped)
-        else:
-            msg = f"⏱️ **30-MIN STATUS:** 0 shows parsed. Blocked: {', '.join(blocked_sources) or 'None'}."
+        msg, _ = format_report("⏱️ 30-MIN STATUS: CURRENT DEC 17 SHOWS", shows)
         send_discord(msg, urgent=False)
         state["last_heartbeat"] = now
         state_changed = True
