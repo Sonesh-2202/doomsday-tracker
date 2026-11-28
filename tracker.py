@@ -7,7 +7,7 @@ import requests
 
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 STATE_FILE = "seen_shows.json"
-HEARTBEAT_INTERVAL = 25 * 60  # 25 mins so GitHub's ~5-15m cron jitter triggers reliably every ~30 mins
+HEARTBEAT_INTERVAL = 25 * 60  # Reliable ~30-min heartbeat with GitHub Actions cron
 
 MIRROR_URL = "https://ticketradar.in/f/avengers-doomsday/chennai"
 JUSTDIAL_URL = "https://www.justdial.com/Chennai/Avengers-Doomsday-3d-English-Movie/mct-16315131"
@@ -36,7 +36,6 @@ THEATRE_SPLIT = re.compile(
 
 
 def time_to_minutes(time_str):
-    """Converts '6:00 AM' or '11:35 PM' into minutes from midnight (0 - 1439) for proper chronological sorting."""
     t = time_str.upper().strip()
     is_pm = "PM" in t
     clean = t.replace("AM", "").replace("PM", "").strip()
@@ -50,9 +49,9 @@ def time_to_minutes(time_str):
 
 def get_time_slot(time_str):
     mins = time_to_minutes(time_str)
-    if mins < 8 * 60:          # 12:00 AM - 7:59 AM
+    if mins < 8 * 60:
         return "FDFS"
-    if mins <= 10 * 60 + 30:   # 8:00 AM - 10:30 AM
+    if mins <= 10 * 60 + 30:
         return "MORNING"
     return "OTHER"
 
@@ -63,9 +62,10 @@ def load_state():
             data = json.load(f)
             return {
                 "seen": set(data.get("seen", [])),
+                "known_theatres": set(data.get("known_theatres", [])),
                 "last_heartbeat": data.get("last_heartbeat", 0),
             }
-    return {"seen": set(), "last_heartbeat": 0}
+    return {"seen": set(), "known_theatres": set(), "last_heartbeat": 0}
 
 
 def save_state(state):
@@ -73,6 +73,7 @@ def save_state(state):
         json.dump(
             {
                 "seen": sorted(list(state["seen"])),
+                "known_theatres": sorted(list(state["known_theatres"])),
                 "last_heartbeat": state["last_heartbeat"],
             },
             f,
@@ -80,20 +81,21 @@ def save_state(state):
         )
 
 
-def send_discord(text, urgent=False):
+def send_discord(text, urgent=False, banner=None):
     links = (
-        f"\n🔗 **[BMS Main]({LINKS['bms_main']})** | "
-        f"**[BMS 3D]({LINKS['bms_3d']})** | "
-        f"**[District]({LINKS['district']})** | "
+        f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎟️ **TAP TO BOOK NOW:** **[BMS Main]({LINKS['bms_main']})** • "
+        f"**[BMS 3D]({LINKS['bms_3d']})** • "
+        f"**[District]({LINKS['district']})** • "
         f"**[PVR/INOX]({LINKS['pvr']})**"
     )
     full_text = text + links
     chunks = [full_text[i : i + 3900] for i in range(0, len(full_text), 3900)]
     for idx, chunk in enumerate(chunks):
         payload = {
-            "username": "Avengers Doomsday Tracker",
-            "content": "@everyone 🚨 **FDFS / MORNING ENGLISH TICKETS LIVE!**" if (urgent and idx == 0) else None,
-            "embeds": [{"description": chunk, "color": 15158332 if urgent else 3447003}],
+            "username": "🚨 DOOMSDAY TICKET SNIPER",
+            "content": banner if (urgent and idx == 0) else None,
+            "embeds": [{"description": chunk, "color": 16711680 if urgent else 3447003}],
         }
         requests.post(WEBHOOK_URL, json=payload, timeout=15)
 
@@ -157,7 +159,6 @@ def scrape_ticketradar():
 
 
 def scrape_justdial():
-    """Secondary source for English 3D shows (catches single screens like Sangam Cinemas)."""
     try:
         resp = requests.get(JUSTDIAL_URL, headers=HEADERS, timeout=20)
         if resp.status_code != 200:
@@ -184,50 +185,53 @@ def scrape_justdial():
         return [], None
 
 
-def group_by_theatre(items):
+def group_by_theatre(items, known_theatres=None, highlight_new=False):
     grouped = {}
     for x in items:
-        label = f"**{x['theatre']}** ({x['lang']} • {x['format']})"
+        is_new_theatre = known_theatres is not None and x["theatre"] not in known_theatres
+        badge = "🆕 **[NEW THEATRE]** " if (highlight_new and is_new_theatre) else ""
+        label = f"{badge}**{x['theatre']}** ({x['lang']} • {x['format']})"
         grouped.setdefault(label, []).append(x["time"])
 
     output = []
     for k, v in grouped.items():
-        # Sort chronologically by actual 24-hour time (6:00 AM -> 9:40 AM -> 1:05 PM -> 11:35 PM)
         sorted_times = sorted(set(v), key=time_to_minutes)
-        output.append(f"• {k}\n  └ {', '.join(sorted_times)}")
+        output.append(f"• {k}\n  └ 🕒 **{', '.join(sorted_times)}**")
     return output
 
 
-def format_report(title, items):
+def format_report(title, items, known_theatres=None, highlight_new=False):
     eng_fdfs = [x for x in items if x["lang"] == "English" and x["slot"] == "FDFS"]
     eng_morning = [x for x in items if x["lang"] == "English" and x["slot"] == "MORNING"]
     eng_other = [x for x in items if x["lang"] == "English" and x["slot"] == "OTHER"]
     tamil_all = [x for x in items if x["lang"] == "Tamil"]
 
-    lines = [f"### {title}", ""]
+    lines = [f"## {title}", ""]
     if eng_fdfs:
-        lines.append("🔥 **ENGLISH FDFS (Before 8 AM)**")
-        lines.extend(group_by_theatre(eng_fdfs))
+        lines.append("🔥🔥 **ENGLISH FDFS (6:00 AM – 7:59 AM)** 🔥🔥")
+        lines.extend(group_by_theatre(eng_fdfs, known_theatres, highlight_new))
         lines.append("")
     if eng_morning:
-        lines.append("🌅 **ENGLISH MORNING (8 AM – 10:30 AM)**")
-        lines.extend(group_by_theatre(eng_morning))
+        lines.append("🌅 **ENGLISH MORNING (8:00 AM – 10:30 AM)**")
+        lines.extend(group_by_theatre(eng_morning, known_theatres, highlight_new))
         lines.append("")
     if eng_other:
-        lines.append("🎬 **ENGLISH OTHER SHOWS**")
-        lines.extend(group_by_theatre(eng_other))
+        lines.append("🎬 **ENGLISH AFTERNOON / NIGHT**")
+        lines.extend(group_by_theatre(eng_other, known_theatres, highlight_new))
         lines.append("")
     if tamil_all:
         lines.append("🎟️ **TAMIL SHOWS (Backup)**")
-        lines.extend(group_by_theatre(tamil_all))
+        lines.extend(group_by_theatre(tamil_all, known_theatres, highlight_new))
         lines.append("")
 
-    return "\n".join(lines), bool(eng_fdfs or eng_morning)
+    has_priority_english = bool(eng_fdfs or eng_morning)
+    return "\n".join(lines), has_priority_english
 
 
 def main():
     state = load_state()
     seen = state["seen"]
+    known_theatres = state["known_theatres"]
     now = int(time.time())
     is_first_run = len(seen) == 0
     heartbeat_due = (now - state["last_heartbeat"]) >= HEARTBEAT_INTERVAL
@@ -235,7 +239,6 @@ def main():
     shows, err = scrape_ticketradar()
     jd_shows, _ = scrape_justdial()
 
-    # Merge Justdial theatres not already covered by TicketRadar
     existing_theatres = {s["theatre"].split(":")[0].strip().lower() for s in shows}
     for j in jd_shows:
         prefix = j["theatre"].split("(")[0].strip().lower()
@@ -250,21 +253,49 @@ def main():
         return
 
     new_items = []
+    brand_new_theatres = set()
+
     for item in shows:
         key = f"{item['theatre']}|{item['lang']}|{item['format']}|{item['time']}"
         if key not in seen:
             new_items.append(item)
             seen.add(key)
+            if not is_first_run and item["theatre"] not in known_theatres:
+                brand_new_theatres.add(item["theatre"])
 
     state_changed = False
     if new_items:
-        header = "📋 INITIAL DEC 17 SNAPSHOT (CHRONOLOGICAL)" if is_first_run else "🚨 NEW DEC 17 SHOWS OPENED"
-        msg, urgent = format_report(header, new_items)
-        send_discord(msg, urgent=(urgent or is_first_run))
+        if is_first_run:
+            header = f"📋 INITIAL DEC 17 SNAPSHOT ({len({x['theatre'] for x in new_items})} THEATRES LIVE)"
+            msg, _ = format_report(header, new_items)
+            banner = "@everyone 📋 **DOOMSDAY TRACKER LIVE — INITIAL CHENNAI LIST**"
+            send_discord(msg, urgent=True, banner=banner)
+        else:
+            new_t_count = len(brand_new_theatres)
+            header = (
+                f"🚨🚨 MASSIVE DROP: {new_t_count} NEW THEATRE(S) & {len(new_items)} NEW SHOW(S) ADDED! 🚨🚨"
+                if new_t_count > 0
+                else f"🚨 NEW DEC 17 SHOWTIMES ADDED ({len(new_items)} NEW SLOTS)!"
+            )
+            msg, has_priority_english = format_report(
+                header, new_items, known_theatres=known_theatres, highlight_new=True
+            )
+            urgent = has_priority_english or (new_t_count > 0)
+            banner = (
+                "@everyone 🚨🚨 **NEW CHENNAI SCREEN / FDFS ENGLISH TICKETS JUST OPENED! BOOK NOW!** 🚨🚨"
+                if urgent
+                else None
+            )
+            send_discord(msg, urgent=urgent, banner=banner)
+
+        for item in shows:
+            known_theatres.add(item["theatre"])
         state["last_heartbeat"] = now
         state_changed = True
+
     elif heartbeat_due:
-        msg, _ = format_report("⏱️ 30-MIN STATUS: CURRENT DEC 17 SHOWS", shows)
+        header = f"⏱️ 30-MIN HEARTBEAT ({len({x['theatre'] for x in shows})} THEATRES • {len(shows)} SHOWS LIVE)"
+        msg, _ = format_report(header, shows)
         send_discord(msg, urgent=False)
         state["last_heartbeat"] = now
         state_changed = True
