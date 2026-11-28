@@ -7,7 +7,7 @@ import requests
 
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 STATE_FILE = "seen_shows.json"
-HEARTBEAT_INTERVAL = 25 * 60  # Reliable ~30-min heartbeat with GitHub Actions cron
+HEARTBEAT_INTERVAL = 30 * 60  # Send a heartbeat every ~30 mins (2 cron cycles at */15)
 
 MIRROR_URL = "https://ticketradar.in/f/avengers-doomsday/chennai"
 JUSTDIAL_URL = "https://www.justdial.com/Chennai/Avengers-Doomsday-3d-English-Movie/mct-16315131"
