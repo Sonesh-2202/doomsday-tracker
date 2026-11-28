@@ -2,10 +2,13 @@ name: Avengers Doomsday Dec 17 Tracker
 
 on:
   schedule:
-    # GitHub Actions cron is unreliable with short intervals.
-    # Using */15 is the sweet spot: frequent enough for ticket alerts,
-    # and GitHub is more likely to honour it than */5.
-    - cron: "*/15 * * * *"
+    # GitHub cron as a fallback — unreliable but free backup.
+    # Use an off-beat minute (7,22,37,52) to avoid GitHub's peak-load drops.
+    - cron: "7,22,37,52 * * * *"
+  repository_dispatch:
+    # External cron services (cron-job.org, EasyCron, etc.) hit this
+    # via GitHub API to trigger runs reliably every 15 mins.
+    types: [run-tracker]
   workflow_dispatch:
 
 permissions:
